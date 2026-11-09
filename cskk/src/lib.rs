@@ -23,6 +23,7 @@ use crate::error::CskkError;
 use crate::kana_builder::KanaBuilder;
 use crate::keyevent::KeyEventSeq;
 use crate::keyevent::{CskkKeyEvent, SkkKeyModifier};
+use crate::ranker::{ContextRanker, IdentityRanker, NgramRanker};
 use crate::rule::{CskkRule, CskkRuleMetadata, CskkRuleMetadataEntry};
 use crate::skk_modes::{has_rom2kana_conversion, CompositionMode};
 use crate::skk_modes::{CommaStyle, InputMode, PeriodStyle};
@@ -46,6 +47,7 @@ pub mod error;
 mod form_changer;
 mod kana_builder;
 pub mod keyevent;
+pub mod ranker;
 mod rule;
 pub mod skk_modes;
 #[cfg(test)]
@@ -72,6 +74,15 @@ pub struct CskkContext {
     config: CskkConfig,
     composition_triggers: HashSet<Keysym>,
     //rule: CskkRuleMetadataEntry,
+    // カーソルより前の確定済みテキスト。文脈適応型変換 (context ranking) 用。
+    surrounding_text: String,
+    // 文脈適応型変換の有効/無効。デフォルト無効 (= 従来のSKK動作)。
+    context_ranking_enabled: bool,
+    // 文脈適応型変換のランカー。未設定時はランキングしない。
+    context_ranker: Option<Arc<dyn ContextRanker>>,
+    // 非同期ロード中のN-gramランカーのキャッシュキー。
+    // ロード完了後に context_ranker へ取り込まれる。
+    pending_ngram: Option<(String, Option<String>)>,
 }
 
 /// Test purpose only.
@@ -116,6 +127,17 @@ pub fn skk_context_get_preedit_rs(context: &CskkContext) -> String {
 #[deprecated(since = "3.1.0", note = "Use CskkContext.get_current_input_mode()")]
 pub fn skk_context_get_input_mode_rs(context: &CskkContext) -> InputMode {
     context.current_state_ref().input_mode
+}
+
+///
+/// 文脈ランキング用の個人変換履歴のデフォルト保存先 (XDG data home) を返す。
+///
+fn default_history_path() -> Result<String, CskkError> {
+    let base_directory = xdg::BaseDirectories::with_prefix("libcskk")?;
+    let path = base_directory
+        .place_data_file("context_ranking_history.bin")
+        .map_err(|e| CskkError::Error(format!("Failed to place history file: {}", e)))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 ///
@@ -465,8 +487,27 @@ impl CskkContext {
     /// 現在のraw_to_compositeから変換候補をリストにして、変換候補を指すポインタを0に戻す。
     ///
     fn update_candidate_list(&mut self) {
+        // 非同期ロード中のN-gramモデルが読み込み完了していれば取り込む
+        if let Some((model_path, history_path)) = self.pending_ngram.clone() {
+            if let Some(ranker) = NgramRanker::try_get_cached(&model_path, history_path.as_deref()) {
+                self.context_ranker = Some(ranker);
+                self.pending_ngram = None;
+            }
+        }
         let composite_key = self.current_state_ref().get_composite_key();
-        let candidates = get_all_candidates(&self.dictionaries, &composite_key);
+        let mut candidates = get_all_candidates(&self.dictionaries, &composite_key);
+        // 文脈適応型変換: 有効かつ文脈がある場合のみランカーで並べ替える。
+        // ランカーが失敗した場合は元の辞書順を維持する (従来SKK動作へのフォールバック)。
+        if self.context_ranking_enabled && !self.surrounding_text.is_empty() {
+            if let Some(ranker) = &self.context_ranker {
+                if let Err(e) = ranker.rerank(&self.surrounding_text, &mut candidates) {
+                    log::warn!(
+                        "Context ranking failed. Falling back to the original candidate order. {}",
+                        e
+                    );
+                }
+            }
+        }
         self.current_state().set_new_candidate_list(candidates);
     }
 
@@ -513,6 +554,13 @@ impl CskkContext {
             .get_current_candidate()
         {
             let current_candidate = current_candidate.to_owned();
+
+            // 文脈適応型変換: 確定を個人履歴に記録する。
+            if self.context_ranking_enabled {
+                if let Some(ranker) = &self.context_ranker {
+                    ranker.record(&self.surrounding_text, &current_candidate.output);
+                }
+            }
 
             for cskkdict in self.dictionaries.iter_mut() {
                 confirm_candidate(cskkdict, &current_candidate);
@@ -663,6 +711,81 @@ impl CskkContext {
     fn set_input_mode(&mut self, input_mode: InputMode) {
         let current_state = self.current_state();
         current_state.input_mode = input_mode
+    }
+
+    /// カーソルより前の確定済みテキストを設定する。文脈適応型変換用。
+    /// 空文字列でクリアされる。
+    pub fn set_surrounding_text(&mut self, text: &str) {
+        self.surrounding_text = text.to_string();
+    }
+
+    /// 文脈適応型変換の有効/無効を設定する。
+    pub fn set_context_ranking_enabled(&mut self, enabled: bool) {
+        self.context_ranking_enabled = enabled;
+    }
+
+    /// 文脈適応型変換が有効かを返す。
+    pub fn get_context_ranking_enabled(&self) -> bool {
+        self.context_ranking_enabled
+    }
+
+    /// 文脈適応型変換のランカーを差し替える。
+    /// テストや将来のバックエンド切替 (N-gram、外部推論サーバー) で用いる。
+    pub fn set_context_ranker(&mut self, ranker: Arc<dyn ContextRanker>) {
+        self.context_ranker = Some(ranker);
+    }
+
+    /// N-gramモデルを文脈ランキングのランカーとして読み込む。
+    ///
+    /// model_path が空の場合は XDG データディレクトリから
+    /// "libcskk/context_ngram_model.bin" を探す。
+    /// history_path が空の場合は XDG データディレクトリの
+    /// "libcskk/context_ranking_history.bin" を個人変換履歴として用いる
+    /// (ファイルがなければ新規作成する)。
+    ///
+    /// モデルはプロセスで1回だけバックグラウンドスレッドで読み込まれ、
+    /// 読み込み完了までは従来のSKK変換動作となる (入力はブロックされない)。
+    /// 読み込み済みの場合は即時に利用可能になり true を返す。
+    pub fn use_ngram_ranker(&mut self, model_path: &str, history_path: &str) -> bool {
+        let model_path = if model_path.is_empty() {
+            match crate::env::filepath_from_xdg_data_dir("libcskk/context_ngram_model.bin") {
+                Ok(path) => path,
+                Err(_) => {
+                    log::info!("No ngram model found in XDG data dirs. Keeping the default ranker.");
+                    return false;
+                }
+            }
+        } else {
+            model_path.to_string()
+        };
+        let history_path = if history_path.is_empty() {
+            match default_history_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    log::warn!("Failed to determine history path: {}. History will not be saved.", e);
+                    String::new()
+                }
+            }
+        } else {
+            history_path.to_string()
+        };
+        let history_path = if history_path.is_empty() {
+            None
+        } else {
+            Some(history_path)
+        };
+
+        // 読み込み済みなら即時に利用する
+        if let Some(ranker) = NgramRanker::try_get_cached(&model_path, history_path.as_deref()) {
+            self.context_ranker = Some(ranker);
+            self.pending_ngram = None;
+            return true;
+        }
+        // 未ロードならバックグラウンドで読み込み、完了次第取り込む。
+        // この間の変換は従来のSKK動作 (フォールバック要件)。
+        NgramRanker::spawn_load(&model_path, history_path.clone());
+        self.pending_ngram = Some((model_path, history_path));
+        false
     }
 
     ///
@@ -1540,6 +1663,10 @@ impl CskkContext {
             dictionaries,
             config: CskkConfig::default(),
             composition_triggers,
+            surrounding_text: String::new(),
+            context_ranking_enabled: false,
+            context_ranker: Some(Arc::new(IdentityRanker)),
+            pending_ngram: None,
         })
     }
 
@@ -1582,6 +1709,10 @@ impl CskkContext {
             dictionaries,
             config: CskkConfig::default(),
             composition_triggers: HashSet::new(),
+            surrounding_text: String::new(),
+            context_ranking_enabled: false,
+            context_ranker: Some(Arc::new(IdentityRanker)),
+            pending_ngram: None,
         }
     }
 
@@ -1611,6 +1742,10 @@ impl CskkContext {
             dictionaries,
             config: CskkConfig::default(),
             composition_triggers,
+            surrounding_text: String::new(),
+            context_ranking_enabled: false,
+            context_ranker: Some(Arc::new(IdentityRanker)),
+            pending_ngram: None,
         }
     }
 
@@ -1690,6 +1825,10 @@ mod unit_tests {
             dictionaries,
             config: CskkConfig::default(),
             composition_triggers,
+            surrounding_text: String::new(),
+            context_ranking_enabled: false,
+            context_ranker: Some(Arc::new(IdentityRanker)),
+            pending_ngram: None,
             //rule_metadata,
         }
     }
@@ -1820,5 +1959,139 @@ mod unit_tests {
                 unconverted: None
             })
         )
+    }
+
+    // 文脈適応型変換 (context ranking) のテスト用モックランカー
+    mod context_ranking {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 候補を逆順に並べ替えるモック。呼び出された回数を記録する。
+        struct ReversingRanker {
+            called: AtomicUsize,
+        }
+
+        impl ReversingRanker {
+            fn new() -> Self {
+                ReversingRanker {
+                    called: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl ContextRanker for ReversingRanker {
+            fn rerank(
+                &self,
+                _before_text: &str,
+                candidates: &mut [Candidate],
+            ) -> Result<(), CskkError> {
+                self.called.fetch_add(1, Ordering::SeqCst);
+                candidates.reverse();
+                Ok(())
+            }
+        }
+
+        /// 常に失敗するモック。フォールバック確認用。
+        struct FailingRanker;
+
+        impl ContextRanker for FailingRanker {
+            fn rerank(
+                &self,
+                _before_text: &str,
+                _candidates: &mut [Candidate],
+            ) -> Result<(), CskkError> {
+                Err(CskkError::Error("test ranker failure".to_string()))
+            }
+        }
+
+        fn henkan_candidate_texts(context: &CskkContext) -> Vec<String> {
+            context
+                .current_state_ref()
+                .get_candidate_list()
+                .get_all_candidates()
+                .iter()
+                .map(|candidate| candidate.kouho_text.clone())
+                .collect()
+        }
+
+        #[test]
+        fn context_ranking_reverses_candidates_when_enabled() {
+            init_test_logger();
+            // 従来動作の基準順序
+            let mut control = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            control.process_key_events_string("A i space");
+            let control_order = henkan_candidate_texts(&control);
+            assert!(control_order.len() > 1, "テスト辞書の候補が1つしかない");
+
+            let mut context = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            let ranker = Arc::new(ReversingRanker::new());
+            context.set_surrounding_text("今日は");
+            context.set_context_ranking_enabled(true);
+            // rankerへのArcを2つ作らないよう、呼び出し回数確認用にcloneする
+            let ranker_for_check = Arc::clone(&ranker);
+            context.set_context_ranker(ranker);
+            context.process_key_events_string("A i space");
+
+            let mut expected = control_order.clone();
+            expected.reverse();
+            assert_eq!(henkan_candidate_texts(&context), expected);
+            assert_eq!(ranker_for_check.called.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn context_ranking_not_called_without_surrounding_text() {
+            init_test_logger();
+            let mut control = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            control.process_key_events_string("A i space");
+            let control_order = henkan_candidate_texts(&control);
+
+            let mut context = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            let ranker = Arc::new(ReversingRanker::new());
+            let ranker_for_check = Arc::clone(&ranker);
+            context.set_context_ranking_enabled(true);
+            context.set_context_ranker(ranker);
+            // 文脈 (surrounding text) を設定しない
+            context.process_key_events_string("A i space");
+
+            assert_eq!(henkan_candidate_texts(&context), control_order);
+            assert_eq!(ranker_for_check.called.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn context_ranking_not_called_when_disabled() {
+            init_test_logger();
+            let mut control = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            control.process_key_events_string("A i space");
+            let control_order = henkan_candidate_texts(&control);
+
+            let mut context = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            let ranker = Arc::new(ReversingRanker::new());
+            let ranker_for_check = Arc::clone(&ranker);
+            context.set_surrounding_text("今日は");
+            // context_ranking_enabled はデフォルト false
+            assert!(!context.get_context_ranking_enabled());
+            context.set_context_ranker(ranker);
+            context.process_key_events_string("A i space");
+
+            assert_eq!(henkan_candidate_texts(&context), control_order);
+            assert_eq!(ranker_for_check.called.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn context_ranking_falls_back_on_ranker_error() {
+            init_test_logger();
+            let mut control = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            control.process_key_events_string("A i space");
+            let control_order = henkan_candidate_texts(&control);
+
+            let mut context = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            context.set_surrounding_text("今日は");
+            context.set_context_ranking_enabled(true);
+            context.set_context_ranker(Arc::new(FailingRanker));
+            context.process_key_events_string("A i space");
+
+            // ランカーが失敗した場合は元の辞書順を維持する
+            assert_eq!(henkan_candidate_texts(&context), control_order);
+        }
     }
 }

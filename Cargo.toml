@@ -2,6 +2,7 @@
 members = [
     "cskk",
     "lru_ordered_map",
+    "tools/build_ngram_model",
 ]
 
 [workspace.package]

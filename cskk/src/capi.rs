@@ -976,6 +976,78 @@ pub extern "C" fn skk_context_confirm_candidate_at(context: &mut CskkContext, i:
     skk_context_confirm_candidate_at_rs(context, i as usize)
 }
 
+///
+/// カーソルより前の確定済みテキストを文脈として設定する。文脈適応型変換用。
+/// NULLまたは空文字列の場合は文脈をクリアする。
+/// 変換 (候補リスト更新) の前に呼ばれることを想定している。
+///
+/// # Safety
+/// textは有効なNULL終端の文字列でなければならない。
+///
+#[no_mangle]
+pub unsafe extern "C" fn skk_context_set_surrounding_text(
+    context: &mut CskkContext,
+    text: *const c_char,
+) {
+    if text.is_null() {
+        context.set_surrounding_text("");
+    } else {
+        let cstr = CStr::from_ptr(text);
+        // 不正なUTF-8でも壊れた文脈として扱えるようlossyに変換する。
+        context.set_surrounding_text(&cstr.to_string_lossy());
+    }
+}
+
+///
+/// 文脈適応型変換の有効/無効を設定する。デフォルトは無効 (従来のSKK動作)。
+///
+#[no_mangle]
+pub extern "C" fn skk_context_set_context_ranking_enabled(context: &mut CskkContext, enabled: bool) {
+    context.set_context_ranking_enabled(enabled);
+}
+
+///
+/// 文脈適応型変換が有効かを返す。
+///
+#[no_mangle]
+pub extern "C" fn skk_context_get_context_ranking_enabled(context: &CskkContext) -> bool {
+    context.get_context_ranking_enabled()
+}
+
+///
+/// N-gramモデルを文脈ランキングのランカーとして読み込む。
+/// model_pathが空文字列の場合はXDGデータディレクトリから
+/// "libcskk/context_ngram_model.bin"を探す。
+/// history_pathが空文字列の場合はXDGデータディレクトリの
+/// "libcskk/context_ranking_history.bin"を個人変換履歴として用いる。
+///
+/// モデルはプロセスで1回だけバックグラウンドスレッドで読み込まれる。
+/// 読み込み完了までは従来のSKK変換動作となる (入力はブロックされない)。
+/// 読み込み済みで即時に利用可能になった場合はtrueを返す。
+/// モデルが見つからない/読み込みを開始した直後はfalseを返す。
+///
+/// # Safety
+/// model_path, history_pathは有効なNULL終端の文字列でなければならない。
+///
+#[no_mangle]
+pub unsafe extern "C" fn skk_context_use_ngram_ranker(
+    context: &mut CskkContext,
+    model_path: *const c_char,
+    history_path: *const c_char,
+) -> bool {
+    let model_path = if model_path.is_null() {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        CStr::from_ptr(model_path).to_string_lossy()
+    };
+    let history_path = if history_path.is_null() {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        CStr::from_ptr(history_path).to_string_lossy()
+    };
+    context.use_ngram_ranker(&model_path, &history_path)
+}
+
 /// Set auto start henkan keywords
 ///
 /// # Safety
