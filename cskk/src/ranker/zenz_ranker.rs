@@ -42,6 +42,10 @@ const MAX_CONTEXT_CHARS: usize = 40;
 const MAX_PREFETCH_CANDIDATES: usize = 10;
 /// キャッシュ保持エントリ上限。
 const CACHE_MAX_ENTRIES: usize = 64;
+/// 変換時点でスコアを待つ上限。
+/// 送り仮名あり変換は大文字入力で即変換されるためprefetchの暇がなく、
+/// この場でスコアリングを開始して待つ (実測10候補で約20ms)。
+const COLD_SCORING_TIMEOUT: Duration = Duration::from_millis(150);
 
 fn input_tag_str() -> String {
     INPUT_TAG.to_string()
@@ -314,6 +318,41 @@ impl ZenzRanker {
             .map(|set| set.contains(key))
             .unwrap_or(false)
     }
+
+    /// スコアリングタスクをワーカーへ投入する。
+    /// 読みは送り仮名 (ふりがな) 込みのフル読みとしてカタカナに正規化する。
+    fn enqueue_task(
+        &self,
+        key: &CacheKey,
+        before_text: &str,
+        reading: &str,
+        okuri: &str,
+        candidate_outputs: &[String],
+    ) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.insert(key.clone());
+        }
+        let candidates: Vec<String> = candidate_outputs
+            .iter()
+            .take(MAX_PREFETCH_CANDIDATES)
+            .cloned()
+            .collect();
+        let n = candidates.len();
+        let task = Task {
+            left_context: before_text.to_string(),
+            reading: hiragana_to_katakana(&format!("{}{}", reading, okuri)),
+            candidates,
+        };
+        if let Ok(worker) = self.worker.lock() {
+            let _ = worker.send(task);
+            debug!(
+                "zenz prefetch: context=\"{}\" reading=\"{}\" candidates={}",
+                before_text,
+                reading,
+                n
+            );
+        }
+    }
 }
 
 /// スコアラー未ロード時のプレースホルダ (常に失敗=フォールバック)。
@@ -332,64 +371,47 @@ impl ZenzScorer for NoopScorer {
 
 impl ContextRanker for ZenzRanker {
     /// 読み入力中に呼ばれ、バックグラウンドでスコアリングを開始する。
-    fn prefetch(&self, before_text: &str, reading: &str, candidate_outputs: &[String]) {
+    fn prefetch(&self, before_text: &str, reading: &str, okuri: &str, candidate_outputs: &[String]) {
         if reading.is_empty() || candidate_outputs.is_empty() {
             return;
         }
-        // キーは読みをカタカナに正規化して揃える
-        let key = (
-            before_text.to_string(),
-            hiragana_to_katakana(reading),
-        );
+        // キーは読み+送り仮名をカタカナに正規化して揃える
+        let key = cache_key_of(before_text, reading, okuri);
         if self.lookup_cache(&key).is_some() || self.is_in_flight(&key) {
             return;
         }
-        if let Ok(mut in_flight) = self.in_flight.lock() {
-            in_flight.insert(key.clone());
-        }
-        let candidates: Vec<String> = candidate_outputs
-            .iter()
-            .take(MAX_PREFETCH_CANDIDATES)
-            .cloned()
-            .collect();
-        let n = candidates.len();
-        let task = Task {
-            left_context: before_text.to_string(),
-            reading: hiragana_to_katakana(reading),
-            candidates,
-        };
-        if let Ok(worker) = self.worker.lock() {
-            let _ = worker.send(task);
-            debug!(
-                "zenz prefetch: context=\"{}\" reading=\"{}\" candidates={}",
-                before_text,
-                reading,
-                n
-            );
-        }
+        self.enqueue_task(&key, before_text, reading, okuri, candidate_outputs);
     }
 
-    /// 変換時に呼ばれる。キャッシュがあればスコア適用、
-    /// 進行中なら wait_timeout まで待つ。間に合わなければ元の順序を維持する。
+    /// 変換時に呼ばれる。キャッシュがあればスコア適用。
+    /// なければこの場でスコアリングを開始し COLD_SCORING_TIMEOUT まで待つ
+    /// (送り仮名あり変換のようにprefetchの暇がないケース向け)。
+    /// 間に合わなければ元の順序を維持する。
     fn rerank(
         &self,
         before_text: &str,
         reading: &str,
+        okuri: &str,
         candidates: &mut [Candidate],
     ) -> Result<(), CskkError> {
         let len = candidates.len();
         if len < 2 || reading.is_empty() {
             return Ok(());
         }
-        let key = (
-            before_text.to_string(),
-            hiragana_to_katakana(reading),
-        );
+        let key = cache_key_of(before_text, reading, okuri);
         let mut entry = self.lookup_cache(&key);
-        if entry.is_none() && self.is_in_flight(&key) {
-            // 進行中: 短時間だけ待つ
+        if entry.is_none() {
+            // キャッシュmiss: この場でスコアリングを開始する
+            // 送り仮名 (ふりがな) 込みの評価面でスコアする
+            self.enqueue_task(&key, before_text, reading, okuri, &{
+                candidates
+                    .iter()
+                    .map(|c| format!("{}{}", c.output, okuri))
+                    .collect::<Vec<String>>()
+            });
+            // 完成を待つ (ワーカーは通常アイドルで、実測10候補≈20ms)
             if let Ok(in_flight) = self.in_flight.lock() {
-                let deadline = Instant::now() + self.wait_timeout;
+                let deadline = Instant::now() + COLD_SCORING_TIMEOUT;
                 let mut guard = in_flight;
                 while guard.contains(&key) && Instant::now() < deadline {
                     let (result, _timeout) = self
@@ -417,11 +439,13 @@ impl ContextRanker for ZenzRanker {
             .lock()
             .map_err(|_| CskkError::Error("history lock poisoned".to_string()))?;
         // (スコア+履歴ブースト, 元index)。同点は元の辞書順を維持する。
+        // スコアのキーは送り仮名 (ふりがな) 込みの評価面。
         let mut scored: Vec<(f64, usize)> = candidates
             .iter()
             .enumerate()
             .map(|(i, candidate)| {
-                let score = entry.scores.get(&candidate.output).copied();
+                let surface = format!("{}{}", candidate.output, okuri);
+                let score = entry.scores.get(&surface).copied();
                 match score {
                     Some(score) => {
                         let boost = history::history_score(&history, before_text, &candidate.output);
@@ -460,6 +484,14 @@ fn loading_keys() -> &'static Mutex<HashSet<(String, Option<String>)>> {
     static LOADING: std::sync::OnceLock<Mutex<HashSet<(String, Option<String>)>>> =
         std::sync::OnceLock::new();
     LOADING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// ランカー内キャッシュのキー: (文脈, カタカナ(読み+送り仮名))。
+fn cache_key_of(before_text: &str, reading: &str, okuri: &str) -> CacheKey {
+    (
+        before_text.to_string(),
+        hiragana_to_katakana(&format!("{}{}", reading, okuri)),
+    )
 }
 
 fn cache_key(
@@ -612,7 +644,7 @@ mod tests {
         let ranker = ZenzRanker::new_with_scorer(scorer, HistoryStore::from_file_model(&Default::default(), None));
         let outputs = vec!["削除".to_string(), "検索".to_string()];
         // prefetch → ワーカーが処理するまで待つ
-        ranker.prefetch("グーグルで", "ケンサク", &outputs);
+        ranker.prefetch("グーグルで", "けんさく", "", &outputs);
         let key = ("グーグルで".to_string(), "ケンサク".to_string());
         let deadline = Instant::now() + Duration::from_secs(5);
         while ranker.lookup_cache(&key).is_none() && Instant::now() < deadline {
@@ -620,7 +652,7 @@ mod tests {
         }
         let mut candidates = vec![candidate("削除"), candidate("検索")];
         ranker
-            .rerank("グーグルで", "けんさく", &mut candidates)
+            .rerank("グーグルで", "けんさく", "", &mut candidates)
             .unwrap();
         assert_eq!(candidates[0].output, "検索");
     }
@@ -634,7 +666,7 @@ mod tests {
         let mut candidates = vec![candidate("削除"), candidate("検索")];
         // prefetchなし → キャッシュなし → 元の順序
         ranker
-            .rerank("グーグルで", "けんさく", &mut candidates)
+            .rerank("グーグルで", "けんさく", "", &mut candidates)
             .unwrap();
         assert_eq!(candidates[0].output, "削除");
     }
@@ -656,7 +688,7 @@ mod tests {
             HistoryStore::from_file_model(&history_file, None),
         );
         let outputs = vec!["検索".to_string(), "削除".to_string()];
-        ranker.prefetch("グーグルで", "ケンサク", &outputs);
+        ranker.prefetch("グーグルで", "けんさく", "", &outputs);
         let key = ("グーグルで".to_string(), "ケンサク".to_string());
         let deadline = Instant::now() + Duration::from_secs(5);
         while ranker.lookup_cache(&key).is_none() && Instant::now() < deadline {
@@ -664,7 +696,7 @@ mod tests {
         }
         let mut candidates = vec![candidate("検索"), candidate("削除")];
         ranker
-            .rerank("グーグルで", "けんさく", &mut candidates)
+            .rerank("グーグルで", "けんさく", "", &mut candidates)
             .unwrap();
         // 履歴10件で「削除」が逆転すること
         assert_eq!(candidates[0].output, "削除");

@@ -29,19 +29,28 @@ pub use zenz_ranker::ZenzRanker;
 /// - `rerank` は短いタイムアウト内でキャッシュを参照する
 /// - 重い推論は `prefetch` で読み入力中に非同期に行う
 pub trait ContextRanker: Send {
-    /// `before_text` (カーソル前の確定済みテキスト) と `reading`
-    /// (ひらがな読み) を元に `candidates` をその場で並べ替える。
+    /// `before_text` (カーソル前の確定済みテキスト)、`reading`
+    /// (ひらがな読み、送り仮名を含まない)、`okuri` (ひらがな送り仮名、
+    /// 送りなし変換では空) を元に `candidates` をその場で並べ替える。
     /// 失敗時やスコア未到達の場合は元の順序を維持する。
     fn rerank(
         &self,
         before_text: &str,
         reading: &str,
+        okuri: &str,
         candidates: &mut [Candidate],
     ) -> Result<(), CskkError>;
 
     /// 読み入力中に呼ばれ、変換に先立ってスコアリングを開始する。
     /// デフォルト実装はなにもしない。
-    fn prefetch(&self, _before_text: &str, _reading: &str, _candidate_outputs: &[String]) {}
+    fn prefetch(
+        &self,
+        _before_text: &str,
+        _reading: &str,
+        _okuri: &str,
+        _candidate_outputs: &[String],
+    ) {
+    }
 
     /// 候補が確定した時に呼ばれる。個人学習を行うランカーはこれを記録する。
     /// デフォルト実装はなにもしない。
@@ -58,6 +67,7 @@ impl ContextRanker for IdentityRanker {
         &self,
         _before_text: &str,
         _reading: &str,
+        _okuri: &str,
         _candidates: &mut [Candidate],
     ) -> Result<(), CskkError> {
         Ok(())
@@ -89,7 +99,7 @@ mod tests {
                 "相".to_string(),
             ),
         ];
-        let result = ranker.rerank("今日は", "あい", &mut candidates);
+        let result = ranker.rerank("今日は", "あい", "", &mut candidates);
         assert!(result.is_ok());
         assert_eq!(candidates[0].kouho_text, "愛");
         assert_eq!(candidates[1].kouho_text, "相");
