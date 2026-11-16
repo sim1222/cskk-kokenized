@@ -1015,9 +1015,9 @@ pub extern "C" fn skk_context_get_context_ranking_enabled(context: &CskkContext)
 }
 
 ///
-/// N-gramモデルを文脈ランキングのランカーとして読み込む。
+/// zenzモデル (llama.cpp) を文脈ランキングのランカーとして読み込む。
 /// model_pathが空文字列の場合はXDGデータディレクトリから
-/// "libcskk/context_ngram_model.bin"を探す。
+/// "libcskk/zenz.gguf"を探す。
 /// history_pathが空文字列の場合はXDGデータディレクトリの
 /// "libcskk/context_ranking_history.bin"を個人変換履歴として用いる。
 ///
@@ -1026,11 +1026,14 @@ pub extern "C" fn skk_context_get_context_ranking_enabled(context: &CskkContext)
 /// 読み込み済みで即時に利用可能になった場合はtrueを返す。
 /// モデルが見つからない/読み込みを開始した直後はfalseを返す。
 ///
+/// 実行にはllama.cpp (libllama) が必要。zenz公式GGUFを読むには
+/// azooKey/llama.cppフォーク (libllama-azookey) が必要。
+///
 /// # Safety
 /// model_path, history_pathは有効なNULL終端の文字列でなければならない。
 ///
 #[no_mangle]
-pub unsafe extern "C" fn skk_context_use_ngram_ranker(
+pub unsafe extern "C" fn skk_context_use_zenz_ranker(
     context: &mut CskkContext,
     model_path: *const c_char,
     history_path: *const c_char,
@@ -1045,7 +1048,7 @@ pub unsafe extern "C" fn skk_context_use_ngram_ranker(
     } else {
         CStr::from_ptr(history_path).to_string_lossy()
     };
-    context.use_ngram_ranker(&model_path, &history_path)
+    context.use_zenz_ranker(&model_path, &history_path)
 }
 
 /// Set auto start henkan keywords

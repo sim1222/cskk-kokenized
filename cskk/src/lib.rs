@@ -23,7 +23,7 @@ use crate::error::CskkError;
 use crate::kana_builder::KanaBuilder;
 use crate::keyevent::KeyEventSeq;
 use crate::keyevent::{CskkKeyEvent, SkkKeyModifier};
-use crate::ranker::{ContextRanker, IdentityRanker, NgramRanker};
+use crate::ranker::{ContextRanker, IdentityRanker, ZenzRanker};
 use crate::rule::{CskkRule, CskkRuleMetadata, CskkRuleMetadataEntry};
 use crate::skk_modes::{has_rom2kana_conversion, CompositionMode};
 use crate::skk_modes::{CommaStyle, InputMode, PeriodStyle};
@@ -80,9 +80,11 @@ pub struct CskkContext {
     context_ranking_enabled: bool,
     // 文脈適応型変換のランカー。未設定時はランキングしない。
     context_ranker: Option<Arc<dyn ContextRanker>>,
-    // 非同期ロード中のN-gramランカーのキャッシュキー。
+    // 非同期ロード中のzenzランカーのキャッシュキー。
     // ロード完了後に context_ranker へ取り込まれる。
-    pending_ngram: Option<(String, Option<String>)>,
+    pending_zenz: Option<(String, Option<String>)>,
+    // prefetch済みの (文脈, 読み)。同一キーでの再prefetchを避ける。
+    last_prefetch: Option<(String, String)>,
 }
 
 /// Test purpose only.
@@ -487,20 +489,23 @@ impl CskkContext {
     /// 現在のraw_to_compositeから変換候補をリストにして、変換候補を指すポインタを0に戻す。
     ///
     fn update_candidate_list(&mut self) {
-        // 非同期ロード中のN-gramモデルが読み込み完了していれば取り込む
-        if let Some((model_path, history_path)) = self.pending_ngram.clone() {
-            if let Some(ranker) = NgramRanker::try_get_cached(&model_path, history_path.as_deref()) {
+        // 非同期ロード中のzenzモデルが読み込み完了していれば取り込む
+        if let Some((model_path, history_path)) = self.pending_zenz.clone() {
+            if let Some(ranker) = ZenzRanker::try_get_cached(&model_path, history_path.as_deref()) {
                 self.context_ranker = Some(ranker);
-                self.pending_ngram = None;
+                self.pending_zenz = None;
             }
         }
         let composite_key = self.current_state_ref().get_composite_key();
         let mut candidates = get_all_candidates(&self.dictionaries, &composite_key);
         // 文脈適応型変換: 有効かつ文脈がある場合のみランカーで並べ替える。
-        // ランカーが失敗した場合は元の辞書順を維持する (従来SKK動作へのフォールバック)。
+        // ランカーが失敗した場合やスコア未到達の場合は元の辞書順を維持する
+        // (従来SKK動作へのフォールバック)。
         if self.context_ranking_enabled && !self.surrounding_text.is_empty() {
             if let Some(ranker) = &self.context_ranker {
-                if let Err(e) = ranker.rerank(&self.surrounding_text, &mut candidates) {
+                let before = self.surrounding_text.clone();
+                let reading = composite_key.get_to_composite().to_string();
+                if let Err(e) = ranker.rerank(&before, &reading, &mut candidates) {
                     log::warn!(
                         "Context ranking failed. Falling back to the original candidate order. {}",
                         e
@@ -509,6 +514,44 @@ impl CskkContext {
             }
         }
         self.current_state().set_new_candidate_list(candidates);
+    }
+
+    ///
+    /// 読み入力中に、文脈ランキングのスコアリングを先読みする (遅延隠蔽)。
+    /// 重い推論はこのタイミングでバックグラウンド開始され、
+    /// 変換 (Space) 時点ではキャッシュを参照するだけになる。
+    ///
+    fn maybe_prefetch_ranking(&mut self) {
+        if !self.context_ranking_enabled || self.surrounding_text.is_empty() {
+            return;
+        }
+        let state = self.current_state_ref();
+        let composition_mode = state.composition_mode;
+        // 読みを入力している最中のみ先読みする
+        if composition_mode != CompositionMode::PreComposition
+            && composition_mode != CompositionMode::PreCompositionOkurigana
+        {
+            return;
+        }
+        let reading = state.get_to_composite_string().to_string();
+        if reading.is_empty() {
+            return;
+        }
+        let before = self.surrounding_text.clone();
+        let key = (before.clone(), reading.clone());
+        if self.last_prefetch.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_prefetch = Some(key);
+        if let Some(ranker) = &self.context_ranker {
+            let composite_key = self.current_state_ref().get_composite_key();
+            let candidates = get_all_candidates(&self.dictionaries, &composite_key);
+            let outputs: Vec<String> = candidates
+                .iter()
+                .map(|candidate| candidate.output.clone())
+                .collect();
+            ranker.prefetch(&before, &reading, &outputs);
+        }
     }
 
     ///
@@ -735,10 +778,10 @@ impl CskkContext {
         self.context_ranker = Some(ranker);
     }
 
-    /// N-gramモデルを文脈ランキングのランカーとして読み込む。
+    /// zenzモデル (llama.cpp) を文脈ランキングのランカーとして読み込む。
     ///
     /// model_path が空の場合は XDG データディレクトリから
-    /// "libcskk/context_ngram_model.bin" を探す。
+    /// "libcskk/zenz.gguf" を探す。
     /// history_path が空の場合は XDG データディレクトリの
     /// "libcskk/context_ranking_history.bin" を個人変換履歴として用いる
     /// (ファイルがなければ新規作成する)。
@@ -746,12 +789,18 @@ impl CskkContext {
     /// モデルはプロセスで1回だけバックグラウンドスレッドで読み込まれ、
     /// 読み込み完了までは従来のSKK変換動作となる (入力はブロックされない)。
     /// 読み込み済みの場合は即時に利用可能になり true を返す。
-    pub fn use_ngram_ranker(&mut self, model_path: &str, history_path: &str) -> bool {
+    ///
+    /// 実行には llama.cpp (libllama) が必要。zenz公式GGUFを読むには
+    /// azooKey/llama.cppフォーク (libllama-azookey) が必要。
+    /// 見つからない場合も従来のSKK動作を維持する。
+    pub fn use_zenz_ranker(&mut self, model_path: &str, history_path: &str) -> bool {
         let model_path = if model_path.is_empty() {
-            match crate::env::filepath_from_xdg_data_dir("libcskk/context_ngram_model.bin") {
+            match crate::env::filepath_from_xdg_data_dir("libcskk/zenz.gguf") {
                 Ok(path) => path,
                 Err(_) => {
-                    log::info!("No ngram model found in XDG data dirs. Keeping the default ranker.");
+                    log::info!(
+                        "No zenz model found in XDG data dirs. Keeping the default ranker."
+                    );
                     return false;
                 }
             }
@@ -762,7 +811,10 @@ impl CskkContext {
             match default_history_path() {
                 Ok(path) => path,
                 Err(e) => {
-                    log::warn!("Failed to determine history path: {}. History will not be saved.", e);
+                    log::warn!(
+                        "Failed to determine history path: {}. History will not be saved.",
+                        e
+                    );
                     String::new()
                 }
             }
@@ -776,15 +828,15 @@ impl CskkContext {
         };
 
         // 読み込み済みなら即時に利用する
-        if let Some(ranker) = NgramRanker::try_get_cached(&model_path, history_path.as_deref()) {
+        if let Some(ranker) = ZenzRanker::try_get_cached(&model_path, history_path.as_deref()) {
             self.context_ranker = Some(ranker);
-            self.pending_ngram = None;
+            self.pending_zenz = None;
             return true;
         }
         // 未ロードならバックグラウンドで読み込み、完了次第取り込む。
         // この間の変換は従来のSKK動作 (フォールバック要件)。
-        NgramRanker::spawn_load(&model_path, history_path.clone());
-        self.pending_ngram = Some((model_path, history_path));
+        ZenzRanker::spawn_load(&model_path, history_path.clone());
+        self.pending_zenz = Some((model_path, history_path));
         false
     }
 
@@ -852,7 +904,10 @@ impl CskkContext {
             // TODO: from ueno/libskk's comment, returning false for all release might need to be reconsidered on dictionary editing.
             return false;
         }
-        self.process_key_event_inner_v2(key_event)
+        let result = self.process_key_event_inner_v2(key_event);
+        // 読み入力の更新に合わせて文脈ランキングのスコアリングを先読みする
+        self.maybe_prefetch_ranking();
+        result
     }
 
     pub fn save_dictionary(&mut self) {
@@ -1666,7 +1721,8 @@ impl CskkContext {
             surrounding_text: String::new(),
             context_ranking_enabled: false,
             context_ranker: Some(Arc::new(IdentityRanker)),
-            pending_ngram: None,
+            pending_zenz: None,
+            last_prefetch: None,
         })
     }
 
@@ -1712,7 +1768,8 @@ impl CskkContext {
             surrounding_text: String::new(),
             context_ranking_enabled: false,
             context_ranker: Some(Arc::new(IdentityRanker)),
-            pending_ngram: None,
+            pending_zenz: None,
+            last_prefetch: None,
         }
     }
 
@@ -1745,7 +1802,8 @@ impl CskkContext {
             surrounding_text: String::new(),
             context_ranking_enabled: false,
             context_ranker: Some(Arc::new(IdentityRanker)),
-            pending_ngram: None,
+            pending_zenz: None,
+            last_prefetch: None,
         }
     }
 
@@ -1828,7 +1886,8 @@ mod unit_tests {
             surrounding_text: String::new(),
             context_ranking_enabled: false,
             context_ranker: Some(Arc::new(IdentityRanker)),
-            pending_ngram: None,
+            pending_zenz: None,
+            last_prefetch: None,
             //rule_metadata,
         }
     }
@@ -1983,6 +2042,7 @@ mod unit_tests {
             fn rerank(
                 &self,
                 _before_text: &str,
+                _reading: &str,
                 candidates: &mut [Candidate],
             ) -> Result<(), CskkError> {
                 self.called.fetch_add(1, Ordering::SeqCst);
@@ -1998,6 +2058,7 @@ mod unit_tests {
             fn rerank(
                 &self,
                 _before_text: &str,
+                _reading: &str,
                 _candidates: &mut [Candidate],
             ) -> Result<(), CskkError> {
                 Err(CskkError::Error("test ranker failure".to_string()))
@@ -2092,6 +2153,39 @@ mod unit_tests {
 
             // ランカーが失敗した場合は元の辞書順を維持する
             assert_eq!(henkan_candidate_texts(&context), control_order);
+        }
+
+        /// 実モデルでCskkContext全体のフローを検証する (通常のcargo testではスキップ)。
+        /// 実行: CSKK_ZENZ_MODEL=model.gguf cargo test zenz_full_flow -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn zenz_full_flow() {
+            use crate::ranker::zenz_ranker::{LlamaScorer, ZenzRanker};
+            init_test_logger();
+            let model = std::env::var("CSKK_ZENZ_MODEL").expect("CSKK_ZENZ_MODEL");
+            let mut context = new_test_context(InputMode::Hiragana, CompositionMode::Direct);
+            context.set_surrounding_text("私は今日は三");
+            context.set_context_ranking_enabled(true);
+            let scorer = LlamaScorer::load(&model).unwrap();
+            context.set_context_ranker(ZenzRanker::new_with_scorer(
+                Arc::new(scorer),
+                crate::ranker::history::HistoryStore::from_file_model(&Default::default(), None),
+            ));
+            context.process_key_events_string("K a i");
+            // prefetchのワーカー処理を待つ
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            context.process_key_events_string("space");
+            let list = context
+                .current_state_ref()
+                .get_candidate_list()
+                .get_all_candidates();
+            let top: Vec<&str> = list.iter().take(5).map(|c| c.output.as_str()).collect();
+            println!("top5 = {:?}", top);
+            assert!(
+                list[0].output == "回",
+                "回 should be ranked first: {:?}",
+                top
+            );
         }
     }
 }

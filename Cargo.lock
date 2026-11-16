@@ -216,16 +216,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "build_ngram_model"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "cskk",
- "encoding_rs",
- "serde",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -707,6 +697,7 @@ dependencies = [
  "enum-display-derive",
  "env_logger",
  "lazy_static",
+ "libloading",
  "log",
  "lru_ordered_map",
  "nom 8.0.0",
