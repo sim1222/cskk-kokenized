@@ -136,10 +136,23 @@ impl LlamaScorer {
                 v
             })
             .unwrap_or(PromptVersion::V3);
-        Ok(LlamaScorer {
+        let scorer = LlamaScorer {
             runtime: Mutex::new(runtime),
             version,
-        })
+        };
+        // ウォームアップ: 初回推論はGPUバックエンドの初期化
+        // (Vulkanのシェーダコンパイル等) で数秒かかるため、
+        // モデルロード時に1回済ませておく (変換時のタイムアウトを防ぐ)。
+        let started = Instant::now();
+        let warmup = scorer.score("", "ア", &["ア".to_string()]);
+        match warmup {
+            Ok(_) => log::info!(
+                "libcskk: zenz warmup done in {:?}",
+                started.elapsed()
+            ),
+            Err(e) => log::warn!("libcskk: zenz warmup failed: {}", e),
+        }
+        Ok(scorer)
     }
 }
 
@@ -155,11 +168,20 @@ impl ZenzScorer for LlamaScorer {
             .lock()
             .map_err(|_| CskkError::Error("llama runtime lock poisoned".to_string()))?;
         let prompt = build_prompt(self.version, left_context, reading);
+        let t0 = std::time::Instant::now();
         let (prompt_len, prompt_row) = runtime.prepare_prompt(&prompt)?;
+        let t1 = std::time::Instant::now();
         let mut scores = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             scores.push(runtime.score_continuation(prompt_len, &prompt_row, candidate)?);
         }
+        let t2 = std::time::Instant::now();
+        debug!(
+            "zenz score timing: prompt={:?} candidates({})={:?}",
+            t1 - t0,
+            candidates.len(),
+            t2 - t1
+        );
         runtime.clear_cache();
         Ok(scores)
     }
@@ -257,7 +279,13 @@ impl ZenzRanker {
                 return;
             }
         };
+        let started = Instant::now();
         let result = scorer.score(&task.left_context, &task.reading, &task.candidates);
+        debug!(
+            "zenz score took {:?} for {} candidates",
+            started.elapsed(),
+            task.candidates.len()
+        );
         match result {
             Ok(scores) => {
                 if log_enabled!(log::Level::Debug) {
@@ -395,6 +423,13 @@ impl ContextRanker for ZenzRanker {
         candidates: &mut [Candidate],
     ) -> Result<(), CskkError> {
         let len = candidates.len();
+        debug!(
+            "zenz rerank: context=\"{}\" reading=\"{}\" okuri=\"{}\" candidates={}",
+            before_text,
+            reading,
+            okuri,
+            len
+        );
         if len < 2 || reading.is_empty() {
             return Ok(());
         }

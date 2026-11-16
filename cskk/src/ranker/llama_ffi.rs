@@ -20,6 +20,7 @@
 use crate::error::CskkError;
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_void, CString};
+use log::debug;
 use std::os::raw::c_float;
 
 pub(crate) type LlamaModel = c_void;
@@ -164,14 +165,6 @@ impl LlamaApi {
         apis
     }
 
-    /// 後方互換: 最初に見つかったライブラリを読み込む。
-    pub(crate) fn load() -> Result<Self, CskkError> {
-        Self::load_candidates().into_iter().next().ok_or_else(|| {
-            CskkError::Error(
-                "libllama not found (llama.cpp required for zenz ranking)".to_string(),
-            )
-        })
-    }
 
     fn from_library(lib: Library) -> Result<Self, CskkError> {
         // シンボルは生ポインタで取得し、型付き関数ポインタへtransmuteする
@@ -343,8 +336,9 @@ impl LlamaRuntime {
     /// モデルをロードする。複数のllama.cppがインストールされている場合は
     /// 優先順に試行し、モデルを読めるもので初期化する
     /// (azooKeyフォークはzenz公式GGUF用、mainlineはjinen等の新しめのGGUF用)。
-    /// n_gpu_layers = -1 で全レイヤーGPUオフロードを試み、
-    /// 無理な場合はllama.cppが自動的にCPUへフォールバックする (Vulkan/CPU)。
+    /// GPUオフロード層数は環境変数 CSKK_GPU_LAYERS で変更できる
+    /// (デフォルト -1 = 全層GPU。小さいモデルではVulkanの呼び出しオーバー
+    /// ヘッドが支配するため 0 (CPU) の方が速いことがある)。
     pub(crate) fn new(model_path: &str, n_ctx: u32) -> Result<Self, CskkError> {
         let candidates = LlamaApi::load_candidates();
         if candidates.is_empty() {
@@ -352,9 +346,13 @@ impl LlamaRuntime {
                 "libllama not found (llama.cpp required for zenz ranking)".to_string(),
             ));
         }
+        let n_gpu_layers: i32 = std::env::var("CSKK_GPU_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1);
         let mut last_err: Option<CskkError> = None;
         for api in candidates {
-            match Self::new_with(api, model_path, n_ctx) {
+            match Self::new_with(api, model_path, n_ctx, n_gpu_layers) {
                 Ok(runtime) => return Ok(runtime),
                 Err(e) => {
                     log::warn!("libcskk: model load failed with this llama.cpp, trying next candidate: {}", e);
@@ -371,12 +369,13 @@ impl LlamaRuntime {
         api: LlamaApi,
         model_path: &str,
         n_ctx: u32,
+        n_gpu_layers: i32,
     ) -> Result<Self, CskkError> {
         unsafe {
             (api.backend_init)();
             let mut mparams = (api.model_default_params)();
             let gpu = api.gen.model_n_gpu_layers();
-            mparams.0[gpu..gpu + 4].copy_from_slice(&(-1i32).to_ne_bytes());
+            mparams.0[gpu..gpu + 4].copy_from_slice(&n_gpu_layers.to_ne_bytes());
             let path = CString::new(model_path)
                 .map_err(|e| CskkError::Error(format!("model path: {}", e)))?;
             let model = (api.model_load_from_file)(path.as_ptr(), mparams);
@@ -481,30 +480,41 @@ impl LlamaRuntime {
         Ok(())
     }
 
-    fn decode_one(&mut self, token: LlamaToken) -> Result<(), CskkError> {
-        let mut flags = [1i8];
-        unsafe {
-            let mut batch = (self.api.batch_get_one)(
-                &token as *const LlamaToken as *mut LlamaToken,
-                1,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            poke_batch_logits(&mut batch, &flags);
-            if (self.api.decode)(self.context, batch) != 0 {
-                return Err(CskkError::Error("llama_decode failed".to_string()));
+    /// トークン列を一括decodeし、全トークンのlogitsを要求する
+    /// (候補スコアリング用: 各位置のlogitsから次トークン確率を得る)。
+    fn decode_tokens_with_all_logits(&mut self, tokens: &[LlamaToken]) -> Result<(), CskkError> {
+        const CHUNK: usize = 512;
+        for chunk in tokens.chunks(CHUNK) {
+            let flags = vec![1i8; chunk.len()];
+            unsafe {
+                let mut batch = (self.api.batch_get_one)(
+                    chunk.as_ptr() as *mut LlamaToken,
+                    chunk.len() as c_int,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                poke_batch_logits(&mut batch, &flags);
+                if (self.api.decode)(self.context, batch) != 0 {
+                    return Err(CskkError::Error("llama_decode failed".to_string()));
+                }
             }
         }
         Ok(())
     }
 
-    /// 現在の最終位置のlogitsから target のlog確率を返す。
-    /// 直前のdecodeでは最後のトークンのlogitsのみ要求しているため、
-    /// インデックス -1 (出力の末尾) を使う。
-    fn logprob_of(&mut self, target: LlamaToken) -> Result<f64, CskkError> {
-        let row = self.logits_row()?;
-        Ok(logprob_from_row(&row, target))
+    /// 指定バッチ位置のlogits行から target のlog確率を返す。
+    fn logprob_at(&mut self, batch_index: i32, target: LlamaToken) -> Result<f64, CskkError> {
+        unsafe {
+            let logits = (self.api.get_logits_ith)(self.context, batch_index);
+            if logits.is_null() {
+                return Err(CskkError::Error("no logits".to_string()));
+            }
+            let slice = std::slice::from_raw_parts(logits, self.vocab_n);
+            Ok(logprob_from_row(slice, target))
+        }
     }
+
+
 
     /// 現在の最終位置のlogits行をコピーして返す。
     fn logits_row(&mut self) -> Result<Vec<f32>, CskkError> {
@@ -534,8 +544,9 @@ impl LlamaRuntime {
     }
 
     /// 「promptの続きとしてcandidateが現れる」log確率の総和 (EOS込み)。
-    /// prompt_row はprompt末尾位置のlogits (候補1トークン目の評価に使う。
-    /// 前候補のスコアリング後もlogitsバッファは書き換わっているため)。
+    /// prompt_row はprompt末尾位置のlogits (候補1トークン目の評価に使う)。
+    /// 候補トークンは一括でdecodeし (全トークンのlogitsを要求) 、
+    /// 各位置のlogitsから各トークンのlog確率を取る (推論呼び出し回数の削減)。
     /// 実行後、KVキャッシュはprompt末尾まで巻き戻される。
     pub(crate) fn score_continuation(
         &mut self,
@@ -548,16 +559,18 @@ impl LlamaRuntime {
         if cand_tokens.is_empty() {
             return Ok(f64::NEG_INFINITY);
         }
-        let mut score = 0.0;
-        for (i, &token) in cand_tokens.iter().enumerate() {
-            score += if i == 0 {
-                logprob_from_row(prompt_row, token)
-            } else {
-                self.logprob_of(token)?
-            };
-            self.decode_one(token)?;
+        let len = cand_tokens.len();
+        // 候補トークンを一括decode (全トークンのlogitsを要求する)
+        self.decode_tokens_with_all_logits(&cand_tokens)?;
+
+        // P(cand[0]) はprompt末尾のlogitsから
+        let mut score = logprob_from_row(prompt_row, cand_tokens[0]);
+        // P(cand[i]) (i>=1) はcand[i-1]位置のlogitsから
+        for i in 1..len {
+            score += self.logprob_at((i - 1) as i32, cand_tokens[i])?;
         }
-        score += self.logprob_of(self.eos)?;
+        // P(eos) は候補末尾のlogitsから
+        score += self.logprob_at((len - 1) as i32, self.eos)?;
         self.rewind_kv(prompt_len);
         Ok(score)
     }
@@ -566,9 +579,19 @@ impl LlamaRuntime {
     /// prompt末尾位置のlogits行。
     pub(crate) fn prepare_prompt(&mut self, prompt: &str) -> Result<(i32, Vec<f32>), CskkError> {
         let mut tokens: Vec<LlamaToken> = Vec::with_capacity(256);
+        let t0 = std::time::Instant::now();
         self.tokenize(prompt, &mut tokens)?;
+        let t1 = std::time::Instant::now();
         self.decode_tokens(&tokens)?;
+        let t2 = std::time::Instant::now();
         let row = self.logits_row()?;
+        debug!(
+            "prepare_prompt: tokenize={:?} decode({}tok)={:?} logits={:?}",
+            t1 - t0,
+            tokens.len(),
+            t2 - t1,
+            std::time::Instant::now() - t2
+        );
         Ok((tokens.len() as i32, row))
     }
 

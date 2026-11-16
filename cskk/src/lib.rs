@@ -2161,6 +2161,70 @@ mod unit_tests {
             assert_eq!(henkan_candidate_texts(&context), control_order);
         }
 
+        /// 小文字iで送り仮名を完成させるケース (ユーザー報告の再現)。
+        /// 「もう何日も」+ かk (書/描/欠) で、モデル順序が適用されること。
+        /// 実行: CSKK_ZENZ_MODEL=model.gguf cargo test zenz_okuri_lowercase -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn zenz_okuri_lowercase() {
+            use crate::ranker::zenz_ranker::{LlamaScorer, ZenzRanker, ZenzScorer};
+            crate::ranker::logging::install_logger();
+            let model = std::env::var("CSKK_ZENZ_MODEL").expect("CSKK_ZENZ_MODEL");
+            let make_context = || {
+                let dict = CskkDictionary::new_static_dict(
+                    "tests/data/dictionaries/okuri_test.dat",
+                    "utf-8",
+                    true,
+                )
+                .unwrap();
+                CskkContext::new_from_specified_paths(
+                    InputMode::Hiragana,
+                    CompositionMode::Direct,
+                    vec![Arc::new(dict)],
+                    "../assets/rule/kana_form.toml",
+                    "../assets/rule/ascii_form.toml",
+                    "../assets/rules",
+                )
+            };
+            let mut context = make_context();
+            context.set_surrounding_text("彼の今回の絵は大作のようだ。もう何日も");
+            context.set_context_ranking_enabled(true);
+            let scorer = Arc::new(LlamaScorer::load(&model).unwrap());
+            context.set_context_ranker(ZenzRanker::new_with_scorer(
+                scorer.clone(),
+                crate::ranker::history::HistoryStore::from_file_model(&Default::default(), None),
+            ));
+            // K a K i: 小文字iで送り仮名きが完成 → 自動変換
+            context.process_key_events_string("K a K i");
+            let list = context
+                .current_state_ref()
+                .get_candidate_list()
+                .get_all_candidates();
+            let top: Vec<&str> = list.iter().take(3).map(|c| c.output.as_str()).collect();
+            println!("top3 = {:?}", top);
+            let expected = scorer
+                .score(
+                    "彼の今回の絵は大作のようだ。もう何日も",
+                    "カキ",
+                    &["書き".to_string(), "描き".to_string(), "欠き".to_string()],
+                )
+                .unwrap();
+            let surfaces = ["書", "描", "欠"];
+            let mut order: Vec<usize> = (0..3).collect();
+            order.sort_by(|&a, &b| {
+                expected[b]
+                    .partial_cmp(&expected[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let expected_top: Vec<&str> = order.iter().map(|&i| surfaces[i]).collect();
+            println!("expected = {:?} (scores {:?})", expected_top, expected);
+            assert!(!list.is_empty());
+            assert_eq!(
+                top, expected_top,
+                "candidate order should match the scorer preference"
+            );
+        }
+
         /// 送り仮名あり変換 (大文字で即変換、prefetchの暇がないケース) を
         /// 実モデルで検証する。「さけるちーずを裂いて」の文脈で
         /// さi → 裂 が先頭になること。
