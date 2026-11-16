@@ -1,3 +1,26 @@
+# cskk-kokenized
+
+[naokiri/cskk](https://github.com/naokiri/cskk) のごった混ぜ fork です。
+
+## 追加機能
+
+- **文脈適応型変換候補再ランキング**: 変換時に、カーソル前の文脈から
+  変換候補を自動で並べ替えます。かな漢字変換モデル [zenzai (zenz)](https://huggingface.co/collections/Miwa-Keita/zenz-v25-6784cd5d5714761bc4c303e)
+  を [llama.cpp](https://github.com/ggml-org/llama.cpp) でローカル実行し、
+  各候補の続きやすさ (条件付きlog確率) で順序付けします。
+  - 読み入力中の prefetch による遅延隠蔽、変換時は最大150msだけ待機
+  - モデル・llama.cpp が無い環境では従来のSKK変換にフォールバック
+  - 既存の辞書・学習・操作体系はそのまま
+  - 送り仮名込みのスコアリング、個人変換履歴との合成
+  - llama.cpp は実行時に dlopen (ビルド依存なし)。Vulkan/CPU
+- 設計の詳細は [docs/context-ranking-design.md](docs/context-ranking-design.md) を参照
+
+## 開発について
+
+- 本 fork の開発には Coding Agent を利用しています。
+
+---
+
 ![cskk logo](https://raw.githubusercontent.com/naokiri/cskk-icons/master/256x256/apps/cskk.png) 
 
 
@@ -121,4 +144,3 @@ warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Gen
 
 You should have received a copy of the GNU General Public License along with this program. If not,
 see <https://www.gnu.org/licenses/>.
-
