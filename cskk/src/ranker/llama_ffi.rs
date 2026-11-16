@@ -136,30 +136,41 @@ pub(crate) struct LlamaApi {
 }
 
 impl LlamaApi {
-    /// llama.cppをdlopenする。見つからない場合は Err。
-    pub(crate) fn load() -> Result<Self, CskkError> {
+    /// インストールされている候補ライブラリを優先順にすべて読み込む。
+    /// モデルによっては特定のllama.cppで読めない場合があるため、
+    /// LlamaRuntime側で順に試行してフォールバックする。
+    pub(crate) fn load_candidates() -> Vec<LlamaApi> {
         let mut names: Vec<String> = Vec::new();
         if let Ok(explicit) = std::env::var("CSKK_LLAMA_LIB") {
             names.push(explicit);
         }
         names.extend(LIBRARY_CANDIDATES.iter().map(|s| s.to_string()));
 
-        let mut last_err = String::new();
+        let mut apis = Vec::new();
         for name in names {
             match unsafe { Library::new(&name) } {
-                Ok(lib) => {
-                    log::info!("libcskk: loaded llama.cpp from {}", name);
-                    return Self::from_library(lib);
-                }
-                Err(e) => {
-                    last_err = format!("{}: {}", name, e);
-                }
+                Ok(lib) => match LlamaApi::from_library(lib) {
+                    Ok(api) => {
+                        log::info!("libcskk: llama.cpp candidate loaded from {} (gen {:?})", name, api.gen);
+                        apis.push(api);
+                    }
+                    Err(e) => {
+                        log::warn!("libcskk: {} loaded but missing symbols, skipping: {}", name, e);
+                    }
+                },
+                Err(_e) => {}
             }
         }
-        Err(CskkError::Error(format!(
-            "libllama not found (llama.cpp required for zenz ranking): {}",
-            last_err
-        )))
+        apis
+    }
+
+    /// 後方互換: 最初に見つかったライブラリを読み込む。
+    pub(crate) fn load() -> Result<Self, CskkError> {
+        Self::load_candidates().into_iter().next().ok_or_else(|| {
+            CskkError::Error(
+                "libllama not found (llama.cpp required for zenz ranking)".to_string(),
+            )
+        })
     }
 
     fn from_library(lib: Library) -> Result<Self, CskkError> {
@@ -329,10 +340,38 @@ unsafe fn poke_batch_logits(batch: &mut BatchBuf, flags: &[i8]) {
 }
 
 impl LlamaRuntime {
-    /// モデルをロードする。n_gpu_layers = -1 で全レイヤーGPUオフロードを試み、
+    /// モデルをロードする。複数のllama.cppがインストールされている場合は
+    /// 優先順に試行し、モデルを読めるもので初期化する
+    /// (azooKeyフォークはzenz公式GGUF用、mainlineはjinen等の新しめのGGUF用)。
+    /// n_gpu_layers = -1 で全レイヤーGPUオフロードを試み、
     /// 無理な場合はllama.cppが自動的にCPUへフォールバックする (Vulkan/CPU)。
     pub(crate) fn new(model_path: &str, n_ctx: u32) -> Result<Self, CskkError> {
-        let api = LlamaApi::load()?;
+        let candidates = LlamaApi::load_candidates();
+        if candidates.is_empty() {
+            return Err(CskkError::Error(
+                "libllama not found (llama.cpp required for zenz ranking)".to_string(),
+            ));
+        }
+        let mut last_err: Option<CskkError> = None;
+        for api in candidates {
+            match Self::new_with(api, model_path, n_ctx) {
+                Ok(runtime) => return Ok(runtime),
+                Err(e) => {
+                    log::warn!("libcskk: model load failed with this llama.cpp, trying next candidate: {}", e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            CskkError::Error(format!("failed to load model: {}", model_path))
+        }))
+    }
+
+    fn new_with(
+        api: LlamaApi,
+        model_path: &str,
+        n_ctx: u32,
+    ) -> Result<Self, CskkError> {
         unsafe {
             (api.backend_init)();
             let mut mparams = (api.model_default_params)();
@@ -343,7 +382,7 @@ impl LlamaRuntime {
             let model = (api.model_load_from_file)(path.as_ptr(), mparams);
             if model.is_null() {
                 return Err(CskkError::Error(format!(
-                    "failed to load model: {} (mainlineのllama.cppではzenz公式GGUFを読めません。azooKey/llama.cppフォーク (libllama-azookey) が必要です)",
+                    "failed to load model: {}",
                     model_path
                 )));
             }

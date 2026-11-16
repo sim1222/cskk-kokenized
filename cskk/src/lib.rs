@@ -794,6 +794,7 @@ impl CskkContext {
     /// azooKey/llama.cppフォーク (libllama-azookey) が必要。
     /// 見つからない場合も従来のSKK動作を維持する。
     pub fn use_zenz_ranker(&mut self, model_path: &str, history_path: &str) -> bool {
+        crate::ranker::logging::install_logger();
         let model_path = if model_path.is_empty() {
             match crate::env::filepath_from_xdg_data_dir("libcskk/zenz.gguf") {
                 Ok(path) => path,

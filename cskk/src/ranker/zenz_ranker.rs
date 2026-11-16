@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use log::{debug, log_enabled};
 
 /// プロンプト形式。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -253,19 +254,41 @@ impl ZenzRanker {
             }
         };
         let result = scorer.score(&task.left_context, &task.reading, &task.candidates);
-        if let Ok(scores) = result {
-            let mut map = HashMap::new();
-            for (candidate, score) in task.candidates.iter().zip(scores.iter()) {
-                map.insert(candidate.clone(), *score);
-            }
-            if let Ok(mut cache) = self.cache.lock() {
-                if cache.len() >= CACHE_MAX_ENTRIES {
-                    // 粗く古いエントリを削除 (順序保持ではないが十分)
-                    if let Some(oldest) = cache.keys().next().cloned() {
-                        cache.remove(&oldest);
-                    }
+        match result {
+            Ok(scores) => {
+                if log_enabled!(log::Level::Debug) {
+                    let pairs: Vec<String> = task
+                        .candidates
+                        .iter()
+                        .zip(scores.iter())
+                        .map(|(c, s)| format!("{}={:.2}", c, s))
+                        .collect();
+                    debug!(
+                        "zenz scores: context=\"{}\" reading=\"{}\" {}",
+                        task.left_context,
+                        task.reading,
+                        pairs.join(" ")
+                    );
                 }
-                cache.insert(key.clone(), Arc::new(ScoreEntry { scores: map }));
+                let mut map = HashMap::new();
+                for (candidate, score) in task.candidates.iter().zip(scores.iter()) {
+                    map.insert(candidate.clone(), *score);
+                }
+                if let Ok(mut cache) = self.cache.lock() {
+                    if cache.len() >= CACHE_MAX_ENTRIES {
+                        // 粗く古いエントリを削除 (順序保持ではないが十分)
+                        if let Some(oldest) = cache.keys().next().cloned() {
+                            cache.remove(&oldest);
+                        }
+                    }
+                    cache.insert(key.clone(), Arc::new(ScoreEntry { scores: map }));
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "zenz scoring failed: context=\"{}\" reading=\"{}\": {}",
+                    task.left_context, task.reading, e
+                );
             }
         }
         self.finish_task(&key);
@@ -324,17 +347,25 @@ impl ContextRanker for ZenzRanker {
         if let Ok(mut in_flight) = self.in_flight.lock() {
             in_flight.insert(key.clone());
         }
+        let candidates: Vec<String> = candidate_outputs
+            .iter()
+            .take(MAX_PREFETCH_CANDIDATES)
+            .cloned()
+            .collect();
+        let n = candidates.len();
         let task = Task {
             left_context: before_text.to_string(),
             reading: hiragana_to_katakana(reading),
-            candidates: candidate_outputs
-                .iter()
-                .take(MAX_PREFETCH_CANDIDATES)
-                .cloned()
-                .collect(),
+            candidates,
         };
         if let Ok(worker) = self.worker.lock() {
             let _ = worker.send(task);
+            debug!(
+                "zenz prefetch: context=\"{}\" reading=\"{}\" candidates={}",
+                before_text,
+                reading,
+                n
+            );
         }
     }
 
@@ -372,7 +403,14 @@ impl ContextRanker for ZenzRanker {
         }
         let entry = match entry {
             Some(entry) => entry,
-            None => return Ok(()), // フォールバック: 元の辞書順
+            None => {
+                debug!(
+                    "zenz rerank: no scores yet (context=\"{}\" reading=\"{}\"), keeping dictionary order",
+                    before_text,
+                    reading
+                );
+                return Ok(()); // フォールバック: 元の辞書順
+            }
         };
         let history = self
             .history

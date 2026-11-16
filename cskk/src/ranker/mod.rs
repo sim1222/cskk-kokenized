@@ -18,6 +18,7 @@ use crate::error::CskkError;
 
 pub mod history;
 pub mod llama_ffi;
+pub(crate) mod logging;
 pub mod zenz_ranker;
 
 pub use zenz_ranker::ZenzRanker;
